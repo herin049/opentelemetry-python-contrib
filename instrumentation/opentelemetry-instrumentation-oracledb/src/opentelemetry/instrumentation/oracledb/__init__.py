@@ -98,7 +98,7 @@ else:
 
 _logger = logging.getLogger(__name__)
 
-_DATABASE_SYSTEM = "oracle"
+_DATABASE_SYSTEM = "oracle.db"
 
 _CONNECTION_ATTRIBUTES = {
     "database": "db_name",
@@ -123,6 +123,14 @@ _CONNECT_TARGETS = (
 class _OracleDatabaseApiIntegration(DatabaseApiIntegration):
     def get_connection_attributes(self, connection: object) -> None:
         super().get_connection_attributes(connection)
+
+        # Oracle defines db.namespace as DB_UNIQUE_NAME, not DB_NAME.
+        db_unique_name = getattr(connection, "db_unique_name", None)
+        self.database = db_unique_name if isinstance(db_unique_name, str) and db_unique_name else ""
+        self.name = self.database_system
+        if self.database:
+            self.name += "." + self.database
+
         for attribute_name, connection_attribute in _ORACLE_CONNECTION_ATTRIBUTES.items():
             value = getattr(connection, connection_attribute, None)
             if isinstance(value, str) and value:

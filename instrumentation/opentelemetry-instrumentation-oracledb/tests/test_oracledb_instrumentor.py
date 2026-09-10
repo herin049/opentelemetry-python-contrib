@@ -37,15 +37,6 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
-from opentelemetry.semconv._incubating.attributes.db_attributes import (
-    DB_NAME,
-    DB_STATEMENT,
-    DB_SYSTEM,
-    DB_USER,
-)
-from opentelemetry.semconv._incubating.attributes.net_attributes import (
-    NET_PEER_NAME,
-)
 from opentelemetry.semconv._incubating.attributes.oracle_attributes import (
     ORACLE_DB_DOMAIN,
     ORACLE_DB_INSTANCE_NAME,
@@ -59,7 +50,12 @@ from opentelemetry.semconv._incubating.metrics.db_metrics import (
 from opentelemetry.semconv.attributes.db_attributes import (
     DB_NAMESPACE,
     DB_OPERATION_NAME,
+    DB_QUERY_TEXT,
     DB_SYSTEM_NAME,
+)
+from opentelemetry.semconv.attributes.server_attributes import (
+    SERVER_ADDRESS,
+    SERVER_PORT,
 )
 
 oracledb_connection_module = importlib.import_module("oracledb.connection")
@@ -68,6 +64,7 @@ oracledb_connection_module = importlib.import_module("oracledb.connection")
 def _make_mock_connection(
     *,
     db_name: str = "orcl",
+    db_unique_name: str | None = None,
     db_domain: str = "example.com",
     instance_name: str = "orcl1",
     service_name: str = "freepdb1",
@@ -79,6 +76,7 @@ def _make_mock_connection(
 
     connection = MagicMock()
     connection.db_name = db_name
+    connection.db_unique_name = db_unique_name
     connection.db_domain = db_domain
     connection.instance_name = instance_name
     connection.service_name = service_name
@@ -92,6 +90,7 @@ def _make_mock_connection(
 def _make_mock_async_connection(
     *,
     db_name: str = "orcl",
+    db_unique_name: str | None = None,
     db_domain: str = "example.com",
     instance_name: str = "orcl1",
     service_name: str = "freepdb1",
@@ -108,6 +107,7 @@ def _make_mock_async_connection(
 
     connection = MagicMock()
     connection.db_name = db_name
+    connection.db_unique_name = db_unique_name
     connection.db_domain = db_domain
     connection.instance_name = instance_name
     connection.service_name = service_name
@@ -139,10 +139,12 @@ def _assert_db_metrics(
         points = list(metric.data.data_points)
         assert len(points) == 1
         attributes = dict(points[0].attributes)
+        assert set(attributes) == {
+            DB_OPERATION_NAME,
+            DB_SYSTEM_NAME,
+        }
         assert attributes[DB_SYSTEM_NAME] == _DATABASE_SYSTEM
         assert isinstance(attributes[DB_SYSTEM_NAME], str)
-        assert attributes[DB_NAMESPACE] == "orcl"
-        assert isinstance(attributes[DB_NAMESPACE], str)
         assert attributes[DB_OPERATION_NAME] == "SELECT"
         assert isinstance(attributes[DB_OPERATION_NAME], str)
         assert points[0].count == 1
@@ -231,6 +233,10 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
             module, factory_name = key
             self.assertIs(getattr(module, factory_name), original)
 
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database"},
+    )
     def test_sync_cursor_methods_emit_spans(self):
         method_cases = [
             ("execute", "SELECT id FROM users", (), "SELECT"),
@@ -273,19 +279,24 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
                     self.assertEqual(span.name, span_name)
                     self.assertIs(span.kind, trace_api.SpanKind.CLIENT)
                     self.assertEqual(
-                        span.attributes[DB_SYSTEM],
+                        span.attributes[DB_SYSTEM_NAME],
                         _DATABASE_SYSTEM,
                     )
-                    self.assertIsInstance(span.attributes[DB_SYSTEM], str)
+                    self.assertIsInstance(span.attributes[DB_SYSTEM_NAME], str)
                     self.assertEqual(
-                        span.attributes[DB_STATEMENT],
+                        span.attributes[DB_QUERY_TEXT],
                         statement,
                     )
-                    self.assertIsInstance(span.attributes[DB_STATEMENT], str)
+                    self.assertIsInstance(span.attributes[DB_QUERY_TEXT], str)
 
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database"},
+    )
     def test_connection_attributes_use_oracle_semconv(self):
         connection = _make_mock_connection(
             db_name="FREE",
+            db_unique_name="FREE_UNIQUE",
             db_domain="prod.example.com",
             instance_name="FREE1",
             service_name="FREEPDB1",
@@ -299,22 +310,23 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
 
         span = self.memory_exporter.get_finished_spans()[0]
         expected_attributes = {
-            DB_SYSTEM: _DATABASE_SYSTEM,
-            DB_NAME: "FREE",
-            DB_USER: "app_user",
+            DB_SYSTEM_NAME: "oracle.db",
+            DB_NAMESPACE: "FREE_UNIQUE",
+            DB_QUERY_TEXT: "SELECT 1 FROM dual",
             ORACLE_DB_NAME: "FREE",
             ORACLE_DB_DOMAIN: "prod.example.com",
             ORACLE_DB_INSTANCE_NAME: "FREE1",
             ORACLE_DB_SERVICE: "FREEPDB1",
         }
-        for attribute_name, expected_value in expected_attributes.items():
-            with self.subTest(attribute=attribute_name):
-                self.assertEqual(
-                    span.attributes[attribute_name],
-                    expected_value,
-                )
-                self.assertIsInstance(span.attributes[attribute_name], str)
-        self.assertNotIn(NET_PEER_NAME, span.attributes)
+        self.assertEqual(dict(span.attributes), expected_attributes)
+        for attribute_value in span.attributes.values():
+            self.assertIsInstance(attribute_value, str)
+        for unavailable_attribute in (
+            DB_OPERATION_NAME,
+            SERVER_ADDRESS,
+            SERVER_PORT,
+        ):
+            self.assertNotIn(unavailable_attribute, span.attributes)
 
     def test_sync_connection_attribute_writes_are_forwarded(self):
         connection = _make_mock_connection()
@@ -520,6 +532,10 @@ class TestOracleDBInstrumentorAsync(
     _OracleDBTestBase,
     IsolatedAsyncioTestCase,
 ):
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database"},
+    )
     async def test_async_cursor_methods_emit_spans(self):
         method_cases = [
             ("execute", "SELECT id FROM users", (), "SELECT"),
@@ -563,19 +579,24 @@ class TestOracleDBInstrumentorAsync(
                     self.assertEqual(span.name, span_name)
                     self.assertIs(span.kind, trace_api.SpanKind.CLIENT)
                     self.assertEqual(
-                        span.attributes[DB_SYSTEM],
+                        span.attributes[DB_SYSTEM_NAME],
                         _DATABASE_SYSTEM,
                     )
-                    self.assertIsInstance(span.attributes[DB_SYSTEM], str)
+                    self.assertIsInstance(span.attributes[DB_SYSTEM_NAME], str)
                     self.assertEqual(
-                        span.attributes[DB_STATEMENT],
+                        span.attributes[DB_QUERY_TEXT],
                         statement,
                     )
-                    self.assertIsInstance(span.attributes[DB_STATEMENT], str)
+                    self.assertIsInstance(span.attributes[DB_QUERY_TEXT], str)
 
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database"},
+    )
     async def test_async_connection_attributes_use_oracle_semconv(self):
         connection = _make_mock_async_connection(
             db_name="FREE",
+            db_unique_name="FREE_UNIQUE",
             db_domain="prod.example.com",
             instance_name="FREE1",
             service_name="FREEPDB1",
@@ -598,22 +619,23 @@ class TestOracleDBInstrumentorAsync(
 
         span = self.memory_exporter.get_finished_spans()[0]
         expected_attributes = {
-            DB_SYSTEM: _DATABASE_SYSTEM,
-            DB_NAME: "FREE",
-            DB_USER: "app_user",
+            DB_SYSTEM_NAME: "oracle.db",
+            DB_NAMESPACE: "FREE_UNIQUE",
+            DB_QUERY_TEXT: "SELECT 1 FROM dual",
             ORACLE_DB_NAME: "FREE",
             ORACLE_DB_DOMAIN: "prod.example.com",
             ORACLE_DB_INSTANCE_NAME: "FREE1",
             ORACLE_DB_SERVICE: "FREEPDB1",
         }
-        for attribute_name, expected_value in expected_attributes.items():
-            with self.subTest(attribute=attribute_name):
-                self.assertEqual(
-                    span.attributes[attribute_name],
-                    expected_value,
-                )
-                self.assertIsInstance(span.attributes[attribute_name], str)
-        self.assertNotIn(NET_PEER_NAME, span.attributes)
+        self.assertEqual(dict(span.attributes), expected_attributes)
+        for attribute_value in span.attributes.values():
+            self.assertIsInstance(attribute_value, str)
+        for unavailable_attribute in (
+            DB_OPERATION_NAME,
+            SERVER_ADDRESS,
+            SERVER_PORT,
+        ):
+            self.assertNotIn(unavailable_attribute, span.attributes)
 
     @patch.dict(
         "os.environ",
