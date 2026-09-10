@@ -10,7 +10,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import oracledb
 
+try:
+    # wrapt 2.0.0+
+    from wrapt import BaseObjectProxy  # pylint: disable=no-name-in-module
+except ImportError:
+    from wrapt import ObjectProxy as BaseObjectProxy
+
 from opentelemetry import trace as trace_api
+from opentelemetry.instrumentation._semconv import (
+    OTEL_SEMCONV_STABILITY_OPT_IN,
+    _OpenTelemetrySemanticConventionStability,
+)
 from opentelemetry.instrumentation.dbapi import TracedConnectionProxy
 from opentelemetry.instrumentation.oracledb import (
     _CONNECTION_ATTRIBUTES,
@@ -20,6 +30,8 @@ from opentelemetry.instrumentation.oracledb import (
 )
 from opentelemetry.instrumentation.oracledb.package import _instruments
 from opentelemetry.instrumentation.oracledb.version import __version__
+from opentelemetry.sdk.metrics import MeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
@@ -39,6 +51,15 @@ from opentelemetry.semconv._incubating.attributes.oracle_attributes import (
     ORACLE_DB_INSTANCE_NAME,
     ORACLE_DB_NAME,
     ORACLE_DB_SERVICE,
+)
+from opentelemetry.semconv._incubating.metrics.db_metrics import (
+    DB_CLIENT_OPERATION_DURATION,
+    DB_CLIENT_RESPONSE_RETURNED_ROWS,
+)
+from opentelemetry.semconv.attributes.db_attributes import (
+    DB_NAMESPACE,
+    DB_OPERATION_NAME,
+    DB_SYSTEM_NAME,
 )
 
 oracledb_connection_module = importlib.import_module("oracledb.connection")
@@ -97,11 +118,47 @@ def _make_mock_async_connection(
     return connection
 
 
+def _assert_db_metrics(
+    metrics_reader: InMemoryMetricReader,
+    expected_rows: int,
+) -> None:
+    metrics_data = metrics_reader.get_metrics_data()
+    assert metrics_data is not None
+    metrics = {
+        metric.name: metric
+        for resource_metrics in metrics_data.resource_metrics
+        for scope_metrics in resource_metrics.scope_metrics
+        for metric in scope_metrics.metrics
+    }
+    assert set(metrics) == {
+        DB_CLIENT_OPERATION_DURATION,
+        DB_CLIENT_RESPONSE_RETURNED_ROWS,
+    }
+
+    for metric in metrics.values():
+        points = list(metric.data.data_points)
+        assert len(points) == 1
+        attributes = dict(points[0].attributes)
+        assert attributes[DB_SYSTEM_NAME] == _DATABASE_SYSTEM
+        assert isinstance(attributes[DB_SYSTEM_NAME], str)
+        assert attributes[DB_NAMESPACE] == "orcl"
+        assert isinstance(attributes[DB_NAMESPACE], str)
+        assert attributes[DB_OPERATION_NAME] == "SELECT"
+        assert isinstance(attributes[DB_OPERATION_NAME], str)
+        assert points[0].count == 1
+        assert isinstance(points[0].count, int)
+
+    rows_point = list(metrics[DB_CLIENT_RESPONSE_RETURNED_ROWS].data.data_points)[0]
+    assert rows_point.sum == expected_rows
+    assert isinstance(rows_point.sum, int)
+
+
 class _OracleDBTestBase:  # pylint: disable=invalid-name
     tracer_provider: TracerProvider
     memory_exporter: InMemorySpanExporter
 
     def setUp(self) -> None:
+        _OpenTelemetrySemanticConventionStability._initialized = False  # pylint: disable=protected-access
         self.tracer_provider = TracerProvider()
         self.memory_exporter = InMemorySpanExporter()
         self.tracer_provider.add_span_processor(SimpleSpanProcessor(self.memory_exporter))
@@ -111,6 +168,7 @@ class _OracleDBTestBase:  # pylint: disable=invalid-name
         if instrumentor.is_instrumented_by_opentelemetry:
             instrumentor.uninstrument()
         self.memory_exporter.clear()
+        _OpenTelemetrySemanticConventionStability._initialized = False  # pylint: disable=protected-access
 
     def _instrument(self, **kwargs) -> None:
         kwargs.setdefault("tracer_provider", self.tracer_provider)
@@ -258,6 +316,59 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
                 self.assertIsInstance(span.attributes[attribute_name], str)
         self.assertNotIn(NET_PEER_NAME, span.attributes)
 
+    def test_sync_connection_attribute_writes_are_forwarded(self):
+        connection = _make_mock_connection()
+        connection.autocommit = False
+        with (
+            patch.object(oracledb, "connect", return_value=connection),
+            self._instrumented(),
+        ):
+            instrumented = oracledb.connect(
+                user="scott",
+                password="tiger",
+                dsn="localhost/freepdb1",
+            )
+            self.assertIsInstance(instrumented, BaseObjectProxy)
+            instrumented.autocommit = True
+
+        self.assertTrue(connection.autocommit)
+
+    def test_sync_cursor_attribute_writes_are_forwarded(self):
+        connection = _make_mock_connection()
+        cursor = connection.cursor.return_value
+        cursor.arraysize = 100
+        with (
+            patch.object(oracledb, "connect", return_value=connection),
+            self._instrumented(),
+        ):
+            instrumented = oracledb.connect(
+                user="scott",
+                password="tiger",
+                dsn="localhost/freepdb1",
+            )
+            instrumented_cursor = instrumented.cursor()
+            self.assertIsInstance(instrumented_cursor, BaseObjectProxy)
+            instrumented_cursor.arraysize = 200
+
+        self.assertEqual(cursor.arraysize, 200)
+
+    def test_sync_pool_releases_instrumented_connection(self):
+        connection = MagicMock(spec=oracledb.Connection)
+        pool = oracledb.ConnectionPool.__new__(oracledb.ConnectionPool)
+        pool._impl = MagicMock()
+        pool._impl.return_connection = MagicMock()
+        pool.on_connect_callback = None
+
+        with (
+            patch.object(oracledb, "connect", return_value=connection),
+            self._instrumented(),
+        ):
+            pool._set_connection_type(None)
+            instrumented = pool.acquire()
+            self.assertIsInstance(instrumented, BaseObjectProxy)
+            self.assertIsInstance(instrumented, oracledb.Connection)
+            pool.release(instrumented)
+
     def test_sync_errors_are_recorded_and_reraised_unmodified(self):
         for method in ("execute", "executemany", "callproc"):
             with self.subTest(method=method):
@@ -307,6 +418,23 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
         self.assertEqual(self.memory_exporter.get_finished_spans(), ())
         self.assertEqual(len(other_exporter.get_finished_spans()), 1)
 
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database"},
+    )
+    def test_custom_meter_provider_is_respected(self):
+        metrics_reader = InMemoryMetricReader()
+        meter_provider = MeterProvider(metric_readers=[metrics_reader])
+        connection = _make_mock_connection()
+        connection.cursor.return_value.rowcount = 3
+        with (
+            patch.object(oracledb, "connect", return_value=connection),
+            self._instrumented(meter_provider=meter_provider),
+        ):
+            self._run_cursor_method()
+
+        _assert_db_metrics(metrics_reader, 3)
+
     def test_instrument_connection_and_uninstrument_connection(self):
         instrumentor = OracleDBInstrumentor()
         raw_connection = _make_mock_connection()
@@ -325,34 +453,67 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
         uninstrumented.cursor().execute("SELECT 1 FROM dual")
         self.assertEqual(self.memory_exporter.get_finished_spans(), ())
 
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database"},
+    )
+    def test_instrument_connection_uses_custom_meter_provider(self):
+        metrics_reader = InMemoryMetricReader()
+        meter_provider = MeterProvider(metric_readers=[metrics_reader])
+        raw_connection = _make_mock_connection()
+        raw_connection.cursor.return_value.rowcount = 4
+        connection = OracleDBInstrumentor.instrument_connection(
+            raw_connection,
+            tracer_provider=self.tracer_provider,
+            meter_provider=meter_provider,
+        )
+
+        connection.cursor().execute("SELECT 1 FROM dual")
+
+        _assert_db_metrics(metrics_reader, 4)
+
+    @patch("opentelemetry.instrumentation.oracledb._wrap_connect_async")
     @patch("opentelemetry.instrumentation.oracledb.dbapi.wrap_connect")
-    def test_instrument_forwards_configuration(self, wrap_connect):
+    def test_instrument_forwards_configuration(
+        self,
+        wrap_connect,
+        wrap_connect_async,
+    ):
+        meter_provider = MagicMock()
         with self._instrumented(
             enable_commenter=True,
             commenter_options={"db_driver": False},
             enable_attribute_commenter=True,
+            meter_provider=meter_provider,
         ):
-            self.assertEqual(wrap_connect.call_count, 2)
+            for wrapper, method_name in (
+                (wrap_connect, "connect"),
+                (wrap_connect_async, "connect_async"),
+            ):
+                self.assertEqual(wrapper.call_count, 2)
+                for call in wrapper.call_args_list:
+                    args, kwargs = call
+                    self.assertEqual(
+                        args[0],
+                        "opentelemetry.instrumentation.oracledb",
+                    )
+                    self.assertEqual(args[2], method_name)
+                    self.assertEqual(args[3], _DATABASE_SYSTEM)
+                    self.assertEqual(args[4], _CONNECTION_ATTRIBUTES)
+                    self.assertEqual(kwargs["version"], __version__)
+                    self.assertIs(kwargs["meter_provider"], meter_provider)
+                    self.assertTrue(kwargs["enable_commenter"])
+                    self.assertEqual(
+                        kwargs["commenter_options"],
+                        {"db_driver": False},
+                    )
+                    self.assertTrue(kwargs["enable_attribute_commenter"])
+
             for call in wrap_connect.call_args_list:
-                args, kwargs = call
-                self.assertEqual(
-                    args[0],
-                    "opentelemetry.instrumentation.oracledb",
-                )
-                self.assertEqual(args[2], "connect")
-                self.assertEqual(args[3], _DATABASE_SYSTEM)
-                self.assertEqual(args[4], _CONNECTION_ATTRIBUTES)
-                self.assertEqual(kwargs["version"], __version__)
                 self.assertIs(
-                    kwargs["db_api_integration_factory"],
+                    call.kwargs["db_api_integration_factory"],
                     _OracleDatabaseApiIntegration,
                 )
-                self.assertTrue(kwargs["enable_commenter"])
-                self.assertEqual(
-                    kwargs["commenter_options"],
-                    {"db_driver": False},
-                )
-                self.assertTrue(kwargs["enable_attribute_commenter"])
 
 
 class TestOracleDBInstrumentorAsync(
@@ -453,6 +614,97 @@ class TestOracleDBInstrumentorAsync(
                 )
                 self.assertIsInstance(span.attributes[attribute_name], str)
         self.assertNotIn(NET_PEER_NAME, span.attributes)
+
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database"},
+    )
+    async def test_async_custom_meter_provider_is_respected(self):
+        metrics_reader = InMemoryMetricReader()
+        meter_provider = MeterProvider(metric_readers=[metrics_reader])
+        connection = _make_mock_async_connection()
+        connection.cursor.return_value.rowcount = 5
+        with (
+            patch.object(
+                oracledb,
+                "connect_async",
+                MagicMock(return_value=connection),
+            ),
+            self._instrumented(meter_provider=meter_provider),
+        ):
+            instrumented = await oracledb.connect_async(
+                user="scott",
+                password="tiger",
+                dsn="localhost/freepdb1",
+            )
+            await instrumented.cursor().execute("SELECT 1 FROM dual")
+
+        _assert_db_metrics(metrics_reader, 5)
+
+    async def test_async_connection_attribute_writes_are_forwarded(self):
+        connection = _make_mock_async_connection()
+        connection.autocommit = False
+        with (
+            patch.object(
+                oracledb,
+                "connect_async",
+                MagicMock(return_value=connection),
+            ),
+            self._instrumented(),
+        ):
+            instrumented = await oracledb.connect_async(
+                user="scott",
+                password="tiger",
+                dsn="localhost/freepdb1",
+            )
+            self.assertIsInstance(instrumented, BaseObjectProxy)
+            instrumented.autocommit = True
+
+        self.assertTrue(connection.autocommit)
+
+    async def test_async_cursor_attribute_writes_are_forwarded(self):
+        connection = _make_mock_async_connection()
+        cursor = connection.cursor.return_value
+        cursor.arraysize = 100
+        with (
+            patch.object(
+                oracledb,
+                "connect_async",
+                MagicMock(return_value=connection),
+            ),
+            self._instrumented(),
+        ):
+            instrumented = await oracledb.connect_async(
+                user="scott",
+                password="tiger",
+                dsn="localhost/freepdb1",
+            )
+            instrumented_cursor = instrumented.cursor()
+            self.assertIsInstance(instrumented_cursor, BaseObjectProxy)
+            instrumented_cursor.arraysize = 200
+
+        self.assertEqual(cursor.arraysize, 200)
+
+    async def test_async_pool_releases_instrumented_connection(self):
+        connection = MagicMock(spec=oracledb.AsyncConnection)
+        pool = oracledb.AsyncConnectionPool.__new__(oracledb.AsyncConnectionPool)
+        pool._impl = MagicMock()
+        pool._impl.return_connection = AsyncMock()
+        pool.on_connect_callback = None
+
+        with (
+            patch.object(
+                oracledb,
+                "connect_async",
+                AsyncMock(return_value=connection),
+            ),
+            self._instrumented(),
+        ):
+            pool._set_connection_type(None)
+            instrumented = await pool.acquire()
+            self.assertIsInstance(instrumented, BaseObjectProxy)
+            self.assertIsInstance(instrumented, oracledb.AsyncConnection)
+            await pool.release(instrumented)
 
     async def test_async_errors_are_recorded_and_reraised_unmodified(self):
         for method in ("execute", "executemany", "callproc"):

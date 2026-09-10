@@ -85,7 +85,16 @@ from opentelemetry.semconv._incubating.attributes.oracle_attributes import (
 
 if TYPE_CHECKING:
     from opentelemetry.instrumentation.dbapi import TracedConnectionProxy
+    from opentelemetry.metrics import MeterProvider
     from opentelemetry.trace import TracerProvider
+
+    _BaseObjectProxy = wrapt.ObjectProxy[Any]
+else:
+    try:
+        # wrapt 2.0.0+
+        from wrapt import BaseObjectProxy as _BaseObjectProxy
+    except ImportError:
+        from wrapt import ObjectProxy as _BaseObjectProxy
 
 _logger = logging.getLogger(__name__)
 
@@ -120,13 +129,11 @@ class _OracleDatabaseApiIntegration(DatabaseApiIntegration):
                 self.span_attributes[attribute_name] = value
 
 
-class _AsyncTracedCursorProxy:
+# pylint: disable-next=abstract-method
+class _AsyncTracedCursorProxy(_BaseObjectProxy):
     def __init__(self, cursor: Any, db_api_integration: DatabaseApiIntegration) -> None:
-        self.__wrapped__ = cursor
+        super().__init__(cursor)
         self._self_cursor_tracer = CursorTracer[Any](db_api_integration)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.__wrapped__, name)
 
     def __enter__(self) -> _AsyncTracedCursorProxy:
         self.__wrapped__.__enter__()
@@ -161,17 +168,15 @@ class _AsyncTracedCursorProxy:
         )
 
 
-class _AsyncTracedConnectionProxy:
+# pylint: disable-next=abstract-method
+class _AsyncTracedConnectionProxy(_BaseObjectProxy):
     def __init__(
         self,
         connection: Any,
         db_api_integration: DatabaseApiIntegration,
     ) -> None:
-        self.__wrapped__ = connection
+        super().__init__(connection)
         self._self_db_api_integration = db_api_integration
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.__wrapped__, name)
 
     async def __aenter__(self) -> _AsyncTracedConnectionProxy:
         connection = await self.__wrapped__.__aenter__()
@@ -192,13 +197,16 @@ class _AsyncTracedConnectionProxy:
             self._self_db_api_integration.get_connection_attributes(self.__wrapped__)
             return self
 
-        return connect().__await__()
+        return connect().__await__()  # pylint: disable=no-value-for-parameter
 
     def cursor(self, *args: Any, **kwargs: Any) -> _AsyncTracedCursorProxy:
         cursor = self.__wrapped__.cursor(*args, **kwargs)
-        return _AsyncTracedCursorProxy(
-            cursor,
-            self._self_db_api_integration,
+        return cast(
+            _AsyncTracedCursorProxy,
+            _AsyncTracedCursorProxy(
+                cursor,
+                self._self_db_api_integration,
+            ),
         )
 
 
@@ -214,6 +222,7 @@ def _wrap_connect_async(
     enable_commenter: bool,
     commenter_options: dict[str, Any] | None,
     enable_attribute_commenter: bool,
+    meter_provider: MeterProvider | None,
 ) -> None:
     def wrap_connect_async_(
         wrapped: Callable[..., Any],
@@ -231,12 +240,13 @@ def _wrap_connect_async(
             commenter_options=commenter_options,
             connect_module=connect_module,
             enable_attribute_commenter=enable_attribute_commenter,
+            meter_provider=meter_provider,
         )
         connection = wrapped(*args, **kwargs)
         return _AsyncTracedConnectionProxy(connection, integration)
 
     try:
-        wrapt.wrap_function_wrapper(  # pyright: ignore[reportUnknownMemberType]
+        wrapt.wrap_function_wrapper(
             connect_module,
             connect_method_name,
             wrap_connect_async_,
@@ -256,6 +266,7 @@ class OracleDBInstrumentor(BaseInstrumentor):
 
     def _instrument(self, **kwargs: Any) -> None:
         tracer_provider = kwargs.get("tracer_provider")
+        meter_provider = kwargs.get("meter_provider")
         enable_commenter = kwargs.get("enable_commenter", False)
         commenter_options = kwargs.get("commenter_options", {})
         enable_attribute_commenter = kwargs.get(
@@ -277,6 +288,7 @@ class OracleDBInstrumentor(BaseInstrumentor):
                 commenter_options=commenter_options,
                 enable_attribute_commenter=enable_attribute_commenter,
                 db_api_integration_factory=_OracleDatabaseApiIntegration,
+                meter_provider=meter_provider,
             )
             _wrap_connect_async(
                 __name__,
@@ -289,6 +301,7 @@ class OracleDBInstrumentor(BaseInstrumentor):
                 enable_commenter=enable_commenter,
                 commenter_options=commenter_options,
                 enable_attribute_commenter=enable_attribute_commenter,
+                meter_provider=meter_provider,
             )
 
     def _uninstrument(self, **kwargs: Any) -> None:
@@ -305,8 +318,19 @@ class OracleDBInstrumentor(BaseInstrumentor):
         enable_commenter: bool = False,
         commenter_options: dict[str, Any] | None = None,
         enable_attribute_commenter: bool = False,
+        meter_provider: MeterProvider | None = None,
     ) -> TracedConnectionProxy[oracledb.Connection]:
-        """Instrument an existing synchronous OracleDB connection."""
+        """Instrument an existing synchronous OracleDB connection.
+
+        Args:
+            connection: The OracleDB connection to instrument.
+            tracer_provider: The optional tracer provider to use.
+            enable_commenter: Whether to enable SQLCommenter.
+            commenter_options: SQLCommenter configuration options.
+            enable_attribute_commenter: Whether to add the SQL comment to
+                the query span attribute.
+            meter_provider: The optional meter provider to use.
+        """
         return dbapi.instrument_connection(
             __name__,
             connection,
@@ -319,6 +343,7 @@ class OracleDBInstrumentor(BaseInstrumentor):
             connect_module=cast(Callable[..., Any], oracledb),
             enable_attribute_commenter=enable_attribute_commenter,
             db_api_integration_factory=_OracleDatabaseApiIntegration,
+            meter_provider=meter_provider,
         )
 
     @staticmethod
