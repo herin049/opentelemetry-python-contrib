@@ -25,6 +25,7 @@ from opentelemetry.instrumentation.dbapi import TracedConnectionProxy
 from opentelemetry.instrumentation.oracledb import (
     _CONNECTION_ATTRIBUTES,
     _DATABASE_SYSTEM,
+    _DATABASE_SYSTEM_NAME,
     OracleDBInstrumentor,
     _OracleDatabaseApiIntegration,
 )
@@ -36,6 +37,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
+)
+from opentelemetry.semconv._incubating.attributes.db_attributes import (
+    DB_SYSTEM,
 )
 from opentelemetry.semconv._incubating.attributes.oracle_attributes import (
     ORACLE_DB_DOMAIN,
@@ -143,7 +147,7 @@ def _assert_db_metrics(
             DB_OPERATION_NAME,
             DB_SYSTEM_NAME,
         }
-        assert attributes[DB_SYSTEM_NAME] == _DATABASE_SYSTEM
+        assert attributes[DB_SYSTEM_NAME] == _DATABASE_SYSTEM_NAME
         assert isinstance(attributes[DB_SYSTEM_NAME], str)
         assert attributes[DB_OPERATION_NAME] == "SELECT"
         assert isinstance(attributes[DB_OPERATION_NAME], str)
@@ -280,7 +284,7 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
                     self.assertIs(span.kind, trace_api.SpanKind.CLIENT)
                     self.assertEqual(
                         span.attributes[DB_SYSTEM_NAME],
-                        _DATABASE_SYSTEM,
+                        _DATABASE_SYSTEM_NAME,
                     )
                     self.assertIsInstance(span.attributes[DB_SYSTEM_NAME], str)
                     self.assertEqual(
@@ -288,6 +292,40 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
                         statement,
                     )
                     self.assertIsInstance(span.attributes[DB_QUERY_TEXT], str)
+
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: ""},
+    )
+    def test_legacy_database_system(self):
+        connection = _make_mock_connection()
+        with (
+            patch.object(oracledb, "connect", return_value=connection),
+            self._instrumented(),
+        ):
+            self._run_cursor_method()
+
+        attributes = self.memory_exporter.get_finished_spans()[0].attributes
+        self.assertEqual(attributes[DB_SYSTEM], _DATABASE_SYSTEM)
+        self.assertIsInstance(attributes[DB_SYSTEM], str)
+        self.assertNotIn(DB_SYSTEM_NAME, attributes)
+
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database/dup"},
+    )
+    def test_duplicate_database_system(self):
+        connection = _make_mock_connection()
+        with (
+            patch.object(oracledb, "connect", return_value=connection),
+            self._instrumented(),
+        ):
+            self._run_cursor_method()
+
+        attributes = self.memory_exporter.get_finished_spans()[0].attributes
+        for attribute in (DB_SYSTEM, DB_SYSTEM_NAME):
+            self.assertEqual(attributes[attribute], _DATABASE_SYSTEM_NAME)
+            self.assertIsInstance(attributes[attribute], str)
 
     @patch.dict(
         "os.environ",
@@ -310,7 +348,7 @@ class TestOracleDBInstrumentor(_OracleDBTestBase, TestCase):
 
         span = self.memory_exporter.get_finished_spans()[0]
         expected_attributes = {
-            DB_SYSTEM_NAME: "oracle.db",
+            DB_SYSTEM_NAME: _DATABASE_SYSTEM_NAME,
             DB_NAMESPACE: "FREE_UNIQUE",
             DB_QUERY_TEXT: "SELECT 1 FROM dual",
             ORACLE_DB_NAME: "FREE",
@@ -580,7 +618,7 @@ class TestOracleDBInstrumentorAsync(
                     self.assertIs(span.kind, trace_api.SpanKind.CLIENT)
                     self.assertEqual(
                         span.attributes[DB_SYSTEM_NAME],
-                        _DATABASE_SYSTEM,
+                        _DATABASE_SYSTEM_NAME,
                     )
                     self.assertIsInstance(span.attributes[DB_SYSTEM_NAME], str)
                     self.assertEqual(
@@ -588,6 +626,58 @@ class TestOracleDBInstrumentorAsync(
                         statement,
                     )
                     self.assertIsInstance(span.attributes[DB_QUERY_TEXT], str)
+
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: ""},
+    )
+    async def test_async_legacy_database_system(self):
+        connection = _make_mock_async_connection()
+        with (
+            patch.object(
+                oracledb,
+                "connect_async",
+                MagicMock(return_value=connection),
+            ),
+            self._instrumented(),
+        ):
+            instrumented = await oracledb.connect_async(
+                user="scott",
+                password="tiger",
+                dsn="localhost/freepdb1",
+            )
+            await instrumented.cursor().execute("SELECT 1 FROM dual")
+
+        attributes = self.memory_exporter.get_finished_spans()[0].attributes
+        self.assertEqual(attributes[DB_SYSTEM], _DATABASE_SYSTEM)
+        self.assertIsInstance(attributes[DB_SYSTEM], str)
+        self.assertNotIn(DB_SYSTEM_NAME, attributes)
+
+    @patch.dict(
+        "os.environ",
+        {OTEL_SEMCONV_STABILITY_OPT_IN: "database/dup"},
+    )
+    async def test_async_duplicate_database_system(self):
+        connection = _make_mock_async_connection()
+        with (
+            patch.object(
+                oracledb,
+                "connect_async",
+                MagicMock(return_value=connection),
+            ),
+            self._instrumented(),
+        ):
+            instrumented = await oracledb.connect_async(
+                user="scott",
+                password="tiger",
+                dsn="localhost/freepdb1",
+            )
+            await instrumented.cursor().execute("SELECT 1 FROM dual")
+
+        attributes = self.memory_exporter.get_finished_spans()[0].attributes
+        for attribute in (DB_SYSTEM, DB_SYSTEM_NAME):
+            self.assertEqual(attributes[attribute], _DATABASE_SYSTEM_NAME)
+            self.assertIsInstance(attributes[attribute], str)
 
     @patch.dict(
         "os.environ",
@@ -619,7 +709,7 @@ class TestOracleDBInstrumentorAsync(
 
         span = self.memory_exporter.get_finished_spans()[0]
         expected_attributes = {
-            DB_SYSTEM_NAME: "oracle.db",
+            DB_SYSTEM_NAME: _DATABASE_SYSTEM_NAME,
             DB_NAMESPACE: "FREE_UNIQUE",
             DB_QUERY_TEXT: "SELECT 1 FROM dual",
             ORACLE_DB_NAME: "FREE",

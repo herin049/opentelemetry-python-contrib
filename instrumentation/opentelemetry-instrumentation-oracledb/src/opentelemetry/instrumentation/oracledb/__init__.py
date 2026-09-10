@@ -68,6 +68,7 @@ import oracledb
 import oracledb.connection as _oracledb_connection_module
 
 from opentelemetry.instrumentation import dbapi
+from opentelemetry.instrumentation._semconv import _report_new
 from opentelemetry.instrumentation.dbapi import (
     CursorTracer,
     DatabaseApiIntegration,
@@ -108,7 +109,8 @@ else:
 
 _logger = logging.getLogger(__name__)
 
-_DATABASE_SYSTEM = "oracle.db"
+_DATABASE_SYSTEM = "oracle"
+_DATABASE_SYSTEM_NAME = "oracle.db"
 
 _CONNECTION_ATTRIBUTES = {
     "database": "db_name",
@@ -132,6 +134,8 @@ _CONNECT_TARGETS = (
 
 class _OracleDatabaseApiIntegration(DatabaseApiIntegration):
     def get_connection_attributes(self, connection: object) -> None:
+        if _report_new(self._sem_conv_opt_in_mode_db):
+            self.database_system = _DATABASE_SYSTEM_NAME
         super().get_connection_attributes(connection)
 
         # Oracle defines db.namespace as DB_UNIQUE_NAME, not DB_NAME.
