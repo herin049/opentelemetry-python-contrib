@@ -66,7 +66,6 @@ from typing import TYPE_CHECKING, Any, cast
 
 import oracledb
 import oracledb.connection as _oracledb_connection_module
-import wrapt
 
 from opentelemetry.instrumentation import dbapi
 from opentelemetry.instrumentation.dbapi import (
@@ -88,13 +87,24 @@ if TYPE_CHECKING:
     from opentelemetry.metrics import MeterProvider
     from opentelemetry.trace import TracerProvider
 
-    _BaseObjectProxy = wrapt.ObjectProxy[Any]
+    class _BaseObjectProxy:
+        __wrapped__: Any
+
+        def __init__(self, wrapped: Any) -> None: ...
+
+    def _wrap_function_wrapper(
+        module: Callable[..., Any],
+        name: str,
+        wrapper: Callable[..., Any],
+    ) -> None: ...
+
 else:
     try:
         # wrapt 2.0.0+
         from wrapt import BaseObjectProxy as _BaseObjectProxy
     except ImportError:
         from wrapt import ObjectProxy as _BaseObjectProxy
+    from wrapt import wrap_function_wrapper as _wrap_function_wrapper
 
 _logger = logging.getLogger(__name__)
 
@@ -209,12 +219,9 @@ class _AsyncTracedConnectionProxy(_BaseObjectProxy):
 
     def cursor(self, *args: Any, **kwargs: Any) -> _AsyncTracedCursorProxy:
         cursor = self.__wrapped__.cursor(*args, **kwargs)
-        return cast(
-            _AsyncTracedCursorProxy,
-            _AsyncTracedCursorProxy(
-                cursor,
-                self._self_db_api_integration,
-            ),
+        return _AsyncTracedCursorProxy(
+            cursor,
+            self._self_db_api_integration,
         )
 
 
@@ -254,7 +261,7 @@ def _wrap_connect_async(
         return _AsyncTracedConnectionProxy(connection, integration)
 
     try:
-        wrapt.wrap_function_wrapper(
+        _wrap_function_wrapper(
             connect_module,
             connect_method_name,
             wrap_connect_async_,
