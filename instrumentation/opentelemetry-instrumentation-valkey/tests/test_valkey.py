@@ -252,9 +252,7 @@ class TestValkeyAttributes(_ValkeyTestBase):
                 if expected_stored_procedure is None:
                     self.assertNotIn(DB_STORED_PROCEDURE_NAME, span.attributes)
                 else:
-                    self.assertEqual(
-                        span.attributes[DB_STORED_PROCEDURE_NAME], expected_stored_procedure
-                    )
+                    self.assertEqual(span.attributes[DB_STORED_PROCEDURE_NAME], expected_stored_procedure)
 
     def test_query_text_is_sanitized(self):
         client = self._mocked_client()
@@ -630,9 +628,7 @@ class TestValkeyAsyncAttributes(_ValkeyTestBase, IsolatedAsyncioTestCase):
             ),
             (
                 "unix socket",
-                lambda: valkey.asyncio.Valkey.from_url(
-                    "unix://foo@/path/to/socket.sock?db=3&password=bar"
-                ),
+                lambda: valkey.asyncio.Valkey.from_url("unix://foo@/path/to/socket.sock?db=3&password=bar"),
                 lambda client: client.get("key"),
                 {
                     DB_SYSTEM_NAME: "valkey",
@@ -730,9 +726,7 @@ class TestValkeyAsyncAttributes(_ValkeyTestBase, IsolatedAsyncioTestCase):
                 if expected_stored_procedure is None:
                     self.assertNotIn(DB_STORED_PROCEDURE_NAME, span.attributes)
                 else:
-                    self.assertEqual(
-                        span.attributes[DB_STORED_PROCEDURE_NAME], expected_stored_procedure
-                    )
+                    self.assertEqual(span.attributes[DB_STORED_PROCEDURE_NAME], expected_stored_procedure)
 
     async def test_query_text_is_sanitized(self):
         client = self._mocked_async_client()

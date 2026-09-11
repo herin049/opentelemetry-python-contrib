@@ -148,9 +148,7 @@ class TestValkeyUtil(TestBase):
             (
                 "tcp",
                 SimpleNamespace(
-                    connection_pool=SimpleNamespace(
-                        connection_kwargs={"host": "localhost", "port": 6379, "db": 0}
-                    )
+                    connection_pool=SimpleNamespace(connection_kwargs={"host": "localhost", "port": 6379, "db": 0})
                 ),
                 {
                     DB_NAMESPACE: "0",
@@ -163,9 +161,7 @@ class TestValkeyUtil(TestBase):
             ),
             (
                 "unix socket",
-                SimpleNamespace(
-                    connection_pool=SimpleNamespace(connection_kwargs={"path": "/tmp/valkey.sock"})
-                ),
+                SimpleNamespace(connection_pool=SimpleNamespace(connection_kwargs={"path": "/tmp/valkey.sock"})),
                 {
                     DB_NAMESPACE: "0",
                     SERVER_ADDRESS: "/tmp/valkey.sock",
