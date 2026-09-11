@@ -1,15 +1,7 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
-# The helpers below are private to the package but consumed from __init__.py,
-# which pyright's strict mode reports as unused.
 # pyright: reportUnusedFunction=false
-
-"""Helpers shared by the sync and async Valkey wrappers.
-
-Everything in this module is a pure function over the Valkey client objects and
-the stable database semantic conventions.
-"""
 
 from __future__ import annotations
 
@@ -20,7 +12,14 @@ from valkey.exceptions import ResponseError
 
 from opentelemetry.semconv.attributes.db_attributes import (
     DB_NAMESPACE,
+    DB_OPERATION_BATCH_SIZE,
+    DB_OPERATION_NAME,
+    DB_QUERY_TEXT,
+    DB_RESPONSE_STATUS_CODE,
+    DB_STORED_PROCEDURE_NAME,
+    DB_SYSTEM_NAME,
 )
+from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
 from opentelemetry.semconv.attributes.network_attributes import (
     NETWORK_PEER_ADDRESS,
     NETWORK_PEER_PORT,
@@ -31,15 +30,17 @@ from opentelemetry.semconv.attributes.server_attributes import (
     SERVER_ADDRESS,
     SERVER_PORT,
 )
+from opentelemetry.semconv.metrics.db_metrics import DB_CLIENT_OPERATION_DURATION
 
 if TYPE_CHECKING:
     from opentelemetry.instrumentation.valkey.types import (
         AsyncPipelineInstance,
         AsyncValkeyInstance,
+        CommandStackEntry,
         PipelineInstance,
         ValkeyInstance,
     )
-    from opentelemetry.trace import Span
+    from opentelemetry.metrics import Histogram, Meter
     from opentelemetry.util.types import AttributeValue
 
 # ``db.system.name`` has no generated enum member for Valkey: it is absent from
@@ -55,7 +56,18 @@ _DEFAULT_NAMESPACE = "0"
 _CMD_MAX_LEN = 1000
 _VALUE_TOO_LONG_MARK = "..."
 
-_FIELD_TYPES = ("NUMERIC", "TEXT", "GEO", "TAG", "VECTOR")
+# https://opentelemetry.io/docs/specs/semconv/database/database-metrics/
+_DB_DURATION_BUCKETS = [
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1,
+    0.5,
+    1,
+    5,
+    10,
+]
 
 # https://opentelemetry.io/docs/specs/semconv/db/redis/ requires pipelined and
 # transactional calls to be named MULTI or PIPELINE rather than the generic
@@ -66,9 +78,8 @@ _PIPELINE_OPERATION_NAME = "PIPELINE"
 # Commands whose first argument names a Lua script or a function. EVAL and
 # EVAL_RO are excluded on purpose: their first argument is the script body, not
 # a name or a sha1 digest.
-_STORED_PROCEDURE_COMMANDS = frozenset(
-    {"EVALSHA", "EVALSHA_RO", "FCALL", "FCALL_RO"}
-)
+_STORED_PROCEDURE_COMMANDS = ("EVALSHA", "EVALSHA_RO", "FCALL", "FCALL_RO")
+
 
 # Attributes valkey-py uses for the "this pipeline is a transaction" flag. The
 # name differs between the sync client, the async client and .multi().
@@ -81,37 +92,30 @@ _ERROR_CODE_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 def _format_command_args(args: tuple[Any, ...] | list[Any]) -> str:
     """Format and sanitize command arguments, and trim them as needed."""
-    # Sanitized query format: "COMMAND ? ?"
-    args_length = len(args)
-    if args_length == 0:
+    if not args:
         return ""
-
-    out_str = " ".join([str(args[0])] + ["?"] * (args_length - 1))
+    # Sanitized query format: "COMMAND ? ?"
+    out_str = str(args[0]) + " ?" * (len(args) - 1)
     if len(out_str) > _CMD_MAX_LEN:
         out_str = out_str[: _CMD_MAX_LEN - len(_VALUE_TOO_LONG_MARK)] + _VALUE_TOO_LONG_MARK
     return out_str
 
 
-def _get_connection_kwargs(
+def _get_connection_attributes(
     instance: ValkeyInstance | AsyncValkeyInstance,
-) -> dict[str, Any] | None:
-    """Return the connection kwargs of a client, or ``None`` when unavailable.
+) -> dict[str, AttributeValue]:
+    """Return the connection-derived span/metric attributes for a Valkey client.
 
     Cluster clients hold a node manager rather than a single connection pool,
-    and clients built in tests may have a mocked pool, so callers must handle
-    the attributes being absent.
+    and clients built in tests may have a mocked pool, so this returns an
+    empty dict when the attributes are unavailable.
     """
     connection_pool = getattr(instance, "connection_pool", None)
     connection_kwargs = getattr(connection_pool, "connection_kwargs", None)
-    if isinstance(connection_kwargs, dict):
-        return cast("dict[str, Any]", connection_kwargs)
-    return None
+    if not isinstance(connection_kwargs, dict):
+        return {}
+    connection_kwargs = cast("dict[str, Any]", connection_kwargs)
 
-
-def _extract_connection_attributes(
-    connection_kwargs: dict[str, Any],
-) -> dict[str, AttributeValue]:
-    """Transform Valkey connection info into stable semconv attributes."""
     attributes: dict[str, AttributeValue] = {}
 
     db = connection_kwargs.get("db")
@@ -120,7 +124,7 @@ def _extract_connection_attributes(
     attributes[DB_NAMESPACE] = _DEFAULT_NAMESPACE if db is None else str(db)
 
     # A non-cluster client talks to exactly one node, so the peer is always the
-    # configured server; there is no separate node to resolve per operation.
+    # configured server, there is no separate node to resolve per operation.
     if "path" in connection_kwargs:
         path = connection_kwargs.get("path", "")
         attributes[SERVER_ADDRESS] = path
@@ -138,15 +142,34 @@ def _extract_connection_attributes(
     return attributes
 
 
-def _build_span_name(operation_name: str) -> str:
+def _get_common_attributes(
+    instance: Any,
+    operation_name: str,
+    query_text: str | None,
+    stored_procedure_name: str | None,
+    operation_batch_size: int | None,
+) -> dict[str, AttributeValue]:
+    """Return the attributes reported on both the span and the duration metric."""
+    attributes: dict[str, AttributeValue] = {DB_SYSTEM_NAME: DB_SYSTEM_NAME_VALKEY}
+    if operation_name:
+        attributes[DB_OPERATION_NAME] = operation_name
+    attributes.update(_get_connection_attributes(instance))
+    if query_text is not None:
+        attributes[DB_QUERY_TEXT] = query_text
+    if stored_procedure_name is not None:
+        attributes[DB_STORED_PROCEDURE_NAME] = stored_procedure_name
+    if operation_batch_size is not None:
+        attributes[DB_OPERATION_BATCH_SIZE] = operation_batch_size
+    return attributes
+
+
+def _get_span_name(operation_name: str) -> str:
     """Build the span name from ``db.operation.name``.
 
     The Redis conventions exclude ``db.namespace`` from the span name because a
     numeric database index reads confusingly, which leaves the operation name as
     the whole name.
     """
-    # A command always carries an operation, but fall back to the system name so
-    # that a malformed call can never produce an empty span name.
     return operation_name or DB_SYSTEM_NAME_VALKEY
 
 
@@ -166,21 +189,20 @@ def _get_command_stack(
     queues ``PipelineCommand`` objects, and the async cluster pipeline keeps
     them on a private attribute.
     """
-    command_stack = getattr(instance, "command_stack", None)
-    if command_stack is None:
+    command_stack: list[CommandStackEntry] | None = getattr(instance, "command_stack", None)
+    if not isinstance(command_stack, list):
         command_stack = getattr(instance, "_command_stack", None)
-    if not command_stack:
+    if not isinstance(command_stack, list):
         return []
 
     commands: list[tuple[Any, ...]] = []
-    for command in command_stack:
-        args = getattr(command, "args", None)
-        if args is None:
-            try:
-                args = command[0]
-            except (IndexError, KeyError, TypeError):
-                continue
-        commands.append(tuple(args))
+    for entry in command_stack:
+        if isinstance(entry, tuple):
+            commands.append(tuple(entry[0]))
+            continue
+        args = getattr(entry, "args", None)
+        if isinstance(args, tuple):
+            commands.append(cast("tuple[Any, ...]", args))
     return commands
 
 
@@ -208,10 +230,12 @@ def _get_shared_command(command_stack: list[tuple[Any, ...]]) -> str | None:
     """Return the command shared by every queued operation, if there is one."""
     if not command_stack:
         return None
-    commands = {_get_operation_name(command) for command in command_stack}
-    if len(commands) != 1:
+    first = _get_operation_name(command_stack[0])
+    if not first:
         return None
-    return commands.pop() or None
+    if any(_get_operation_name(command) != first for command in command_stack):
+        return None
+    return first
 
 
 def _get_batch_operation_name(
@@ -234,10 +258,12 @@ def _get_batch_stored_procedure_name(
     command_stack: list[tuple[Any, ...]],
 ) -> str | None:
     """Return the stored procedure shared by every queued operation, if any."""
-    names = {_get_stored_procedure_name(command) for command in command_stack}
-    if len(names) != 1:
+    if not command_stack:
         return None
-    return names.pop()
+    first = _get_stored_procedure_name(command_stack[0])
+    if any(_get_stored_procedure_name(command) != first for command in command_stack):
+        return None
+    return first
 
 
 def _get_batch_query_text(command_stack: list[tuple[Any, ...]]) -> str:
@@ -262,57 +288,19 @@ def _get_error_status_code(exception: BaseException) -> str | None:
     return None
 
 
-def _set_span_attribute_if_value(span: Span, name: str, value: AttributeValue | None) -> None:
-    if value is not None and value != "":
-        span.set_attribute(name, value)
+def _get_error_attributes(error_type: str, status_code: str | None) -> dict[str, AttributeValue]:
+    """Return the error attributes shared by the span and the duration metric."""
+    attributes: dict[str, AttributeValue] = {ERROR_TYPE: error_type}
+    if status_code is not None:
+        attributes[DB_RESPONSE_STATUS_CODE] = status_code
+    return attributes
 
 
-def _value_or_none(values: Any, index: int) -> Any:
-    try:
-        return values[index]
-    except (IndexError, KeyError, TypeError):
-        return None
-
-
-def _add_create_index_attributes(span: Span, args: tuple[Any, ...]) -> None:
-    """Attach ``valkey.create_index.*`` attributes for an ``FT.CREATE`` command."""
-    _set_span_attribute_if_value(span, "valkey.create_index.index", _value_or_none(args, 1))
-    # The schema is the last argument of the command, see
-    # https://github.com/valkey-io/valkey-py/blob/main/valkey/commands/search/commands.py
-    try:
-        schema_index = args.index("SCHEMA")
-    except ValueError:
-        return
-    schema = args[schema_index:]
-    # Schema in format:
-    # [first_field_name, first_field_type, first_field_some_attribute1, ..., second_field_name, ...]
-    field_attribute = "".join(
-        f"Field(name: {schema[index - 1]}, type: {schema[index]});"
-        for index in range(1, len(schema))
-        if schema[index] in _FIELD_TYPES
+def _create_duration_histogram(meter: Meter) -> Histogram:
+    """Create the ``db.client.operation.duration`` histogram."""
+    return meter.create_histogram(
+        name=DB_CLIENT_OPERATION_DURATION,
+        description="Duration of database client operations.",
+        unit="s",
+        explicit_bucket_boundaries_advisory=_DB_DURATION_BUCKETS,
     )
-    _set_span_attribute_if_value(span, "valkey.create_index.fields", field_attribute)
-
-
-def _add_search_attributes(span: Span, response: Any, args: tuple[Any, ...]) -> None:
-    """Attach ``valkey.search.*`` attributes for an ``FT.SEARCH`` command."""
-    _set_span_attribute_if_value(span, "valkey.search.index", _value_or_none(args, 1))
-    _set_span_attribute_if_value(span, "valkey.search.query", _value_or_none(args, 2))
-    # Response in format:
-    # [number_of_returned_documents, index_of_first_returned_doc, first_doc(as a list), ...]
-    # Returned documents in array format:
-    # [first_field_name, first_field_value, second_field_name, second_field_value ...]
-    number_of_returned_documents = _value_or_none(response, 0)
-    _set_span_attribute_if_value(span, "valkey.search.total", number_of_returned_documents)
-    if "NOCONTENT" in args or not number_of_returned_documents:
-        return
-    for document_number in range(number_of_returned_documents):
-        document_index = _value_or_none(response, 1 + 2 * document_number)
-        if document_index:
-            document = response[2 + 2 * document_number]
-            for attribute_name_index in range(0, len(document), 2):
-                _set_span_attribute_if_value(
-                    span,
-                    f"valkey.search.xdoc_{document_index}.{document[attribute_name_index]}",
-                    document[attribute_name_index + 1],
-                )

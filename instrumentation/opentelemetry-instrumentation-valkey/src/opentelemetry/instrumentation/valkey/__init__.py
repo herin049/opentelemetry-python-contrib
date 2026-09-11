@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Instrument `valkey`_ to report Valkey queries.
+Instrument the `valkey`_ client to trace Valkey commands and report the
+resulting spans and metrics. This covers single commands, pipelines and
+transactions and cluster clients, across both the sync and asyncio APIs.
 
 There are two options for instrumenting code. The first option is to use the
-``opentelemetry-instrument`` executable which will automatically
+``opentelemetry-instrument`` CLI which will automatically
 instrument your Valkey client. The second is to programmatically enable
 instrumentation via the following code:
 
@@ -84,17 +86,16 @@ Semantic Conventions
 --------------------
 
 This instrumentation emits only the stable database, network and server
-attribute conventions; there is no ``OTEL_SEMCONV_STABILITY_OPT_IN`` migration
+attribute conventions. There is no ``OTEL_SEMCONV_STABILITY_OPT_IN`` migration
 mode. Alongside its spans it reports the ``db.client.operation.duration``
 metric.
 
 Its semconv status is nevertheless ``development``, because the Redis/Valkey
-specific conventions are themselves still in development -- there is no
-registered ``db.system.name`` value for Valkey, and ``db.redis.database_index``
-was removed without a replacement. The attributes reported here may therefore
-still change.
+specific conventions are themselves still in development. There is no
+registered ``db.system.name`` value for Valkey. Thus, the attributes reported
+here may therefore still change.
 
-Two behaviours the conventions ask instrumentations to document explicitly:
+Two behaviors the conventions ask instrumentations to document explicitly:
 
 * ``db.namespace`` reports the database index supplied when the connection was
   established. A connection's index can change later through ``SELECT``, but
@@ -123,39 +124,23 @@ from valkey.exceptions import WatchError
 
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import is_instrumentation_enabled, unwrap
-from opentelemetry.instrumentation.valkey.metrics import (
-    _create_duration_histogram,
-    _extract_metric_attributes,
-    _set_error_metric_attributes,
-)
 from opentelemetry.instrumentation.valkey.package import _instruments
 from opentelemetry.instrumentation.valkey.utils import (
-    DB_SYSTEM_NAME_VALKEY,
-    _add_create_index_attributes,
-    _add_search_attributes,
-    _build_span_name,
-    _extract_connection_attributes,
+    _create_duration_histogram,
     _format_command_args,
     _get_batch_operation_name,
     _get_batch_query_text,
     _get_batch_stored_procedure_name,
     _get_command_stack,
-    _get_connection_kwargs,
+    _get_common_attributes,
+    _get_error_attributes,
     _get_error_status_code,
     _get_operation_name,
+    _get_span_name,
     _get_stored_procedure_name,
 )
 from opentelemetry.instrumentation.valkey.version import __version__
 from opentelemetry.metrics import get_meter
-from opentelemetry.semconv.attributes.db_attributes import (
-    DB_OPERATION_BATCH_SIZE,
-    DB_OPERATION_NAME,
-    DB_QUERY_TEXT,
-    DB_RESPONSE_STATUS_CODE,
-    DB_STORED_PROCEDURE_NAME,
-    DB_SYSTEM_NAME,
-)
-from opentelemetry.semconv.attributes.error_attributes import ERROR_TYPE
 from opentelemetry.semconv.schemas import Schemas
 from opentelemetry.trace import SpanKind, Status, StatusCode, get_tracer
 
@@ -168,7 +153,6 @@ if TYPE_CHECKING:
     )
     from opentelemetry.metrics import Histogram, MeterProvider
     from opentelemetry.trace import Span, Tracer, TracerProvider
-    from opentelemetry.util.types import AttributeValue
 
     # wrapt hands a wrapper the wrapped callable, the bound instance and the
     # call's positional and keyword arguments.
@@ -191,13 +175,6 @@ else:
     from wrapt import wrap_function_wrapper as _wrap_function_wrapper
 
 _logger = logging.getLogger(__name__)
-
-_SCHEMA_URL = Schemas.V1_25_0.value
-
-_INSTRUMENTATION_ATTR = "_is_instrumented_by_opentelemetry"
-
-_FT_CREATE_COMMAND = "FT.CREATE"
-_FT_SEARCH_COMMAND = "FT.SEARCH"
 
 # Wrap targets as (module, class name, method name) so that the same table
 # drives both wrapping and unwrapping.
@@ -225,16 +202,17 @@ def _execute_hook(hook: Callable[..., None], *args: Any) -> None:
     """Call a user supplied hook, logging and swallowing any exception."""
     try:
         hook(*args)
-    except Exception:  # pylint: disable=broad-except
+    # pylint: disable-next=broad-except
+    except Exception:
         _logger.warning("Exception raised by hook %r", hook, exc_info=True)
 
 
 @dataclass
 class _CallContext:
-    """Carries the wrapped call's response back into the tracing helper."""
+    """Carries the wrapped call's result back into the tracing helper."""
 
     span: Span
-    response: Any = None
+    result: Any = None
 
 
 class _ValkeyTelemetry:
@@ -260,19 +238,15 @@ class _ValkeyTelemetry:
         kwargs: dict[str, Any],
     ) -> Iterator[_CallContext]:
         """Trace a single Valkey command."""
-        operation_name = _get_operation_name(args)
-        attributes = self._build_attributes(instance, operation_name)
-        attributes[DB_QUERY_TEXT] = _format_command_args(args)
-        stored_procedure_name = _get_stored_procedure_name(args)
-        if stored_procedure_name is not None:
-            attributes[DB_STORED_PROCEDURE_NAME] = stored_procedure_name
-
-        with self._trace(instance, operation_name, attributes, args, kwargs) as ctx:
-            if operation_name == _FT_CREATE_COMMAND and ctx.span.is_recording():
-                _add_create_index_attributes(ctx.span, args)
+        with self._trace(
+            instance,
+            _get_operation_name(args),
+            args,
+            kwargs,
+            query_text=_format_command_args(args),
+            stored_procedure_name=_get_stored_procedure_name(args),
+        ) as ctx:
             yield ctx
-            if operation_name == _FT_SEARCH_COMMAND and ctx.span.is_recording():
-                _add_search_attributes(ctx.span, ctx.response, args)
 
     @contextmanager
     def trace_pipeline(
@@ -281,43 +255,47 @@ class _ValkeyTelemetry:
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
     ) -> Iterator[_CallContext]:
-        """Trace the execution of a Valkey pipeline."""
+        """Trace the execution of a Valkey pipeline.
+
+        A pipeline holding exactly one command is traced identically to that
+        command executed directly, rather than as a one-item batch.
+        """
         command_stack = _get_command_stack(instance)
-        operation_name = _get_batch_operation_name(instance, command_stack)
-        attributes = self._build_attributes(instance, operation_name)
-        attributes[DB_QUERY_TEXT] = _get_batch_query_text(command_stack)
-        if len(command_stack) != 1:
-            # A request holding a single operation is not a batch, while an
-            # empty one still is and reports a size of zero.
-            attributes[DB_OPERATION_BATCH_SIZE] = len(command_stack)
-        stored_procedure_name = _get_batch_stored_procedure_name(command_stack)
-        if stored_procedure_name is not None:
-            attributes[DB_STORED_PROCEDURE_NAME] = stored_procedure_name
-
-        with self._trace(instance, operation_name, attributes, args, kwargs) as ctx:
+        operation_name = (
+            _get_operation_name(command_stack[0])
+            if len(command_stack) == 1
+            else _get_batch_operation_name(instance, command_stack)
+        )
+        # A request holding a single operation is not a batch, while an empty
+        # one still is and reports a size of zero.
+        batch_size = len(command_stack) if len(command_stack) != 1 else None
+        with self._trace(
+            instance,
+            operation_name,
+            args,
+            kwargs,
+            query_text=_get_batch_query_text(command_stack),
+            stored_procedure_name=_get_batch_stored_procedure_name(command_stack),
+            operation_batch_size=batch_size,
+        ) as ctx:
             yield ctx
-
-    @staticmethod
-    def _build_attributes(instance: Any, operation_name: str) -> dict[str, AttributeValue]:
-        attributes: dict[str, AttributeValue] = {DB_SYSTEM_NAME: DB_SYSTEM_NAME_VALKEY}
-        if operation_name:
-            attributes[DB_OPERATION_NAME] = operation_name
-        connection_kwargs = _get_connection_kwargs(instance)
-        if connection_kwargs is not None:
-            attributes.update(_extract_connection_attributes(connection_kwargs))
-        return attributes
 
     @contextmanager
     def _trace(
         self,
         instance: Any,
         operation_name: str,
-        attributes: dict[str, AttributeValue],
         args: tuple[Any, ...],
         kwargs: dict[str, Any],
+        *,
+        query_text: str | None = None,
+        stored_procedure_name: str | None = None,
+        operation_batch_size: int | None = None,
     ) -> Iterator[_CallContext]:
-        span_name = _build_span_name(operation_name)
-        metric_attributes = _extract_metric_attributes(attributes)
+        attributes = _get_common_attributes(
+            instance, operation_name, query_text, stored_procedure_name, operation_batch_size
+        )
+        span_name = _get_span_name(operation_name)
 
         start_time = time.perf_counter()
         # Exceptions are recorded by hand so that a WatchError, which is control
@@ -337,34 +315,21 @@ class _ValkeyTelemetry:
             except WatchError:
                 raise
             except BaseException as exc:  # pylint: disable=broad-except
-                error_type = type(exc).__qualname__
-                status_code = _get_error_status_code(exc)
-                _set_error_metric_attributes(metric_attributes, error_type, status_code)
-                self._record_error(span, exc, error_type, status_code)
+                error_attributes = _get_error_attributes(type(exc).__qualname__, _get_error_status_code(exc))
+                attributes.update(error_attributes)
+                if span.is_recording():
+                    span.set_attributes(error_attributes)
+                    span.record_exception(exc)
+                    span.set_status(Status(StatusCode.ERROR, str(exc)))
                 raise
             else:
                 if self._response_hook is not None:
-                    _execute_hook(self._response_hook, span, instance, ctx.response)
+                    _execute_hook(self._response_hook, span, instance, ctx.result)
             finally:
                 self._duration_histogram.record(
                     time.perf_counter() - start_time,
-                    attributes=metric_attributes,
+                    attributes=attributes,
                 )
-
-    @staticmethod
-    def _record_error(
-        span: Span,
-        exception: BaseException,
-        error_type: str,
-        status_code: str | None,
-    ) -> None:
-        if not span.is_recording():
-            return
-        span.set_attribute(ERROR_TYPE, error_type)
-        if status_code is not None:
-            span.set_attribute(DB_RESPONSE_STATUS_CODE, status_code)
-        span.record_exception(exception)
-        span.set_status(Status(StatusCode.ERROR, str(exception)))
 
 
 def _traced_execute_command_factory(telemetry: _ValkeyTelemetry) -> _Wrapper:
@@ -377,8 +342,8 @@ def _traced_execute_command_factory(telemetry: _ValkeyTelemetry) -> _Wrapper:
         if not is_instrumentation_enabled():
             return func(*args, **kwargs)
         with telemetry.trace_command(instance, args, kwargs) as ctx:
-            ctx.response = func(*args, **kwargs)
-        return ctx.response
+            ctx.result = func(*args, **kwargs)
+        return ctx.result
 
     return _traced_execute_command
 
@@ -393,8 +358,8 @@ def _traced_execute_pipeline_factory(telemetry: _ValkeyTelemetry) -> _Wrapper:
         if not is_instrumentation_enabled():
             return func(*args, **kwargs)
         with telemetry.trace_pipeline(instance, args, kwargs) as ctx:
-            ctx.response = func(*args, **kwargs)
-        return ctx.response
+            ctx.result = func(*args, **kwargs)
+        return ctx.result
 
     return _traced_execute_pipeline
 
@@ -411,8 +376,8 @@ def _async_traced_execute_command_factory(
         if not is_instrumentation_enabled():
             return await func(*args, **kwargs)
         with telemetry.trace_command(instance, args, kwargs) as ctx:
-            ctx.response = await func(*args, **kwargs)
-        return ctx.response
+            ctx.result = await func(*args, **kwargs)
+        return ctx.result
 
     return _async_traced_execute_command
 
@@ -429,8 +394,8 @@ def _async_traced_execute_pipeline_factory(
         if not is_instrumentation_enabled():
             return await func(*args, **kwargs)
         with telemetry.trace_pipeline(instance, args, kwargs) as ctx:
-            ctx.response = await func(*args, **kwargs)
-        return ctx.response
+            ctx.result = await func(*args, **kwargs)
+        return ctx.result
 
     return _async_traced_execute_pipeline
 
@@ -558,7 +523,7 @@ class ValkeyInstrumentor(BaseInstrumentor):
             response_hook: A hook that receives the span, the client instance and
                 the response of the call.
         """
-        if getattr(client, _INSTRUMENTATION_ATTR, False):
+        if getattr(client, "_is_instrumented_by_opentelemetry", False):
             _logger.warning("Attempting to instrument Valkey connection while already instrumented")
             return
         _instrument_client(
@@ -570,7 +535,7 @@ class ValkeyInstrumentor(BaseInstrumentor):
                 response_hook=response_hook,
             ),
         )
-        setattr(client, _INSTRUMENTATION_ATTR, True)
+        setattr(client, "_is_instrumented_by_opentelemetry", True)
 
     @staticmethod
     def uninstrument_client(client: Any) -> None:
@@ -578,12 +543,12 @@ class ValkeyInstrumentor(BaseInstrumentor):
 
         Pipelines created before this call remain instrumented.
         """
-        if not getattr(client, _INSTRUMENTATION_ATTR, False):
+        if not getattr(client, "_is_instrumented_by_opentelemetry", False):
             _logger.warning("Attempting to un-instrument Valkey connection that wasn't instrumented")
             return
         unwrap(client, "execute_command")
         unwrap(client, "pipeline")
-        setattr(client, _INSTRUMENTATION_ATTR, False)
+        setattr(client, "_is_instrumented_by_opentelemetry", False)
 
 
 def _build_telemetry(**kwargs: Any) -> _ValkeyTelemetry:
@@ -591,13 +556,13 @@ def _build_telemetry(**kwargs: Any) -> _ValkeyTelemetry:
         __name__,
         __version__,
         tracer_provider=kwargs.get("tracer_provider"),
-        schema_url=_SCHEMA_URL,
+        schema_url=Schemas.V1_25_0.value,
     )
     meter = get_meter(
         __name__,
         __version__,
         meter_provider=kwargs.get("meter_provider"),
-        schema_url=_SCHEMA_URL,
+        schema_url=Schemas.V1_25_0.value,
     )
     duration_histogram = _create_duration_histogram(meter)
     return _ValkeyTelemetry(

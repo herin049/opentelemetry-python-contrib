@@ -1,16 +1,12 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Types used by the Valkey instrumentation.
-
-This module imports ``valkey`` at module scope, so it must only be imported
-under ``typing.TYPE_CHECKING``.
-"""
+"""Types used by the Valkey instrumentation."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Any, TypeVar
+from typing import Any, Protocol, TypeVar
 
 import valkey.asyncio.client
 import valkey.asyncio.cluster
@@ -22,6 +18,15 @@ from opentelemetry.trace import Span
 
 RequestHook = Callable[[Span, valkey.connection.Connection, list[Any], dict[str, Any]], None]
 ResponseHook = Callable[[Span, valkey.connection.Connection, Any], None]
+
+
+class QueuedCommand(Protocol):
+    """A command queued on a ``ClusterPipeline``, exposing just what we read."""
+
+    args: tuple[Any, ...]
+
+
+CommandStackEntry = tuple[tuple[Any, ...], dict[str, Any]] | QueuedCommand
 
 AsyncPipelineInstance = TypeVar(
     "AsyncPipelineInstance",
